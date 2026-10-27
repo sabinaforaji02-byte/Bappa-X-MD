@@ -58,7 +58,9 @@ bot.on('text', async ctx => {
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
-
+sock.ev.on('connection.update', update => {
+  console.log('WhatsApp connection update:', update);
+});
     sock.ev.on('creds.update', saveCreds);
     const code = await sock.requestPairingCode(phone);
     await ctx.reply(
