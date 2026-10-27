@@ -1,8 +1,8 @@
+
 import 'dotenv/config';
 import express from 'express';
 import { Telegraf } from 'telegraf';
 import makeWASocket, {
-  Browsers,
   useMultiFileAuthState
 } from '@whiskeysockets/baileys';
 import fs from 'node:fs';
@@ -10,72 +10,168 @@ import path from 'node:path';
 import pino from 'pino';
 
 const app = express();
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const PORT = Number(process.env.PORT || 3000);
-const SECRET = process.env.PAIRING_SECRET || '';
-const sessions = path.resolve('sessions');
-fs.mkdirSync(sessions, { recursive: true });
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-app.get('/', (_req, res) => res.send('Bappa X is running'));
-app.get('/health', (_req, res) => res.json({ ok: true }));
+if (!TOKEN) {
+  throw new Error('TELEGRAM_BOT_TOKEN is missing in Render Environment');
+}
 
-const waiting = new Set();
+const bot = new Telegraf(TOKEN);
+const sessionsDir = path.resolve('sessions');
 const logger = pino({ level: 'silent' });
 
-bot.start(async ctx => {
+fs.mkdirSync(sessionsDir, { recursive: true });
+
+app.get('/', (_req, res) => {
+  res.send('Bappa X is running');
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+const waiting = new Set();
+const activeNumbers = new Set();
+
+bot.start(async (ctx) => {
   waiting.add(ctx.from.id);
+
   await ctx.reply(
-    'Welcome to Bappa X!\n\nSend your WhatsApp number with country code, digits only.\nExample: 8801XXXXXXXXX'
+    'Welcome to Bappa X!\n\n' +
+    'Send your WhatsApp number with country code, digits only.\n' +
+    'Example: 8801XXXXXXXXX'
   );
 });
 
-bot.on('text', async ctx => {
-  if (ctx.message.text.startsWith('/')) return;
-  if (!waiting.has(ctx.from.id)) {
-    return ctx.reply('Send /start first.');
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const message = ctx.message.text.trim();
+
+  if (message.startsWith('/')) return;
+
+  if (!waiting.has(userId)) {
+    await ctx.reply('Send /start first.');
+    return;
   }
 
-  const phone = ctx.message.text.replace(/\D/g, '');
+  const phone = message.replace(/\D/g, '');
+
   if (phone.length < 8 || phone.length > 15) {
-    return ctx.reply('Invalid number. Send country code + number, digits only.');
+    await ctx.reply(
+      'Invalid number. Send country code and number using digits only.'
+    );
+    return;
   }
 
-  waiting.delete(ctx.from.id);
-  const dir = path.join(sessions, phone);
+  if (activeNumbers.has(phone)) {
+    await ctx.reply(
+      'A pairing request is already running for this number. Please wait.'
+    );
+    return;
+  }
+
+  waiting.delete(userId);
+  activeNumbers.add(phone);
+
+  const sessionDir = path.join(sessionsDir, phone);
 
   try {
-    if (fs.existsSync(path.join(dir, 'creds.json'))) {
-      return ctx.reply('A saved session exists for this number. Contact the bot owner.');
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    const { state, saveCreds } =
+      await useMultiFileAuthState(sessionDir);
+
+    if (state.creds.registered) {
+      await ctx.reply(
+        'This number already has registered session credentials. ' +
+        'I will not create another pairing code. Check your existing session.'
+      );
+      return;
     }
 
-    fs.mkdirSync(dir, { recursive: true });
-    const { state, saveCreds } = await useMultiFileAuthState(dir);
     const sock = makeWASocket({
       auth: state,
       logger,
-      browser: Browsers.ubuntu('Chrome'),
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
-sock.ev.on('connection.update', update => {
-  console.log('WhatsApp connection update:', update);
-});
+
+    let codeRequested = false;
+    let codeSent = false;
+
     sock.ev.on('creds.update', saveCreds);
-    const code = await sock.requestPairingCode(phone);
-    await ctx.reply(
-      `Your WhatsApp pairing code: ${code}\n\nOn WhatsApp: Linked devices → Link with phone number, then enter this code.\n\nKeep the code private.`
-    );
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, qr, lastDisconnect } = update;
+
+      console.log('WhatsApp connection:', connection);
+
+      if (qr && !codeRequested && !state.creds.registered) {
+        codeRequested = true;
+
+        try {
+          const code = await sock.requestPairingCode(phone);
+
+          codeSent = true;
+
+          await ctx.reply(
+            `Your WhatsApp pairing code: ${code}\n\n` +
+            'Open WhatsApp → Linked devices → Link a device → ' +
+            'Link with phone number instead.\n\n' +
+            'Enter the code shown above. Keep it private.'
+          );
+        } catch (err) {
+          console.error(
+            'Pairing code error:',
+            err?.message || err
+          );
+
+          await ctx.reply(
+            'Could not generate the pairing code. ' +
+            'Check the Render logs before trying again.'
+          );
+        }
+      }
+
+      if (connection === 'open') {
+        console.log('WhatsApp connected successfully:', phone);
+
+        if (codeSent) {
+          await ctx.reply(
+            'WhatsApp linked successfully!'
+          ).catch(() => {});
+        }
+      }
+
+      if (connection === 'close') {
+        console.error(
+          'WhatsApp disconnected:',
+          lastDisconnect?.error?.message || 'Unknown reason'
+        );
+      }
+    });
   } catch (err) {
-    console.error('Pairing failed:', err?.message || err);
-    await ctx.reply('Pairing failed. Check Render logs and try again later.');
+    console.error('Pairing setup failed:', err?.stack || err);
+
+    await ctx.reply(
+      'Pairing setup failed. Please check the Render logs.'
+    ).catch(() => {});
+  } finally {
+    activeNumbers.delete(phone);
   }
 });
 
-bot.catch(err => console.error('Telegram error:', err?.message || err));
+bot.catch((err) => {
+  console.error('Telegram bot error:', err?.stack || err);
+});
 
 (async () => {
-  app.listen(PORT, () => console.log(`Bappa X listening on ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`Bappa X listening on port ${PORT}`);
+  });
+
   await bot.launch();
   console.log('Telegram bot started');
 })();
